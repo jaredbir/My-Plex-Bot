@@ -46,6 +46,11 @@ class Role(IntEnum):
     ADMIN = 2
     OWNER = 3
 
+
+def get_user_role(discord_id):
+    response = table.get_item(Key={'PK': 'USER#' + str(discord_id), 'SK': 'PROFILE'})
+    return response.get('Item', {}).get('role', 'GUEST')
+                   
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 @bot.event
