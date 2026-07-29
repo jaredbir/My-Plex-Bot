@@ -17,28 +17,32 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
+bot = commands.Bot(command_prefix='!', intents=intents)
+
 dynamodb = boto3.resource('dynamodb',region_name = 'us-east-1')
 table = dynamodb.Table('discord-bot-requests')
 
-table.put_item(
-    Item={
-        'PK': 'USER#12345',
-        'SK': 'PROFILE',
-        'role': 'TRUSTED'
-    }
-)
+# table.put_item(
+#     Item={
+#         'PK': 'USER#171047114611228672',
+#         'SK': 'PROFILE',
+#         'role': 'OWNER'
+#     }
+# )
 
-table.put_item(
-    Item={
-        'PK': 'USER#12345',
-        'SK': 'REQUEST#abc',
-        'title': 'test',
-        'status': 'unfinished',
-        'requestedAt': 1785305756
-    }
-)
+# table.put_item(
+#     Item={
+#         'PK': 'USER#12345',
+#         'SK': 'REQUEST#abc',
+#         'title': 'test',
+#         'status': 'unfinished',
+#         'requestedAt': 1785305756
+#     }
+# )
 
-print(table.query(IndexName='Status-index',KeyConditionExpression=Key('status').eq('unfinished')))
+
+# print(table.query(IndexName='Status-index',KeyConditionExpression=Key('status').eq('unfinished')))
+
 
 class Role(IntEnum):
     GUEST = 0
@@ -47,6 +51,15 @@ class Role(IntEnum):
     OWNER = 3
 
 
+def set_role(discord_id,role):
+    table.put_item(
+    Item={
+        'PK': 'USER#' + str(discord_id),
+        'SK': 'PROFILE',
+        'role': str(role.name)
+    }
+)
+    
 def get_user_role(discord_id):
     response = table.get_item(Key={'PK': 'USER#' + str(discord_id), 'SK': 'PROFILE'})
     return response.get('Item', {}).get('role', 'GUEST')
@@ -56,22 +69,30 @@ def require_role(minimum_role):
     def decorator(func):
         @wraps(func)
         async def wrapper(ctx, *args, **kwargs):
-            user_role_str = get_user_role(ctx.author.id)
+            print("wrapper entered")
+            try:
+                user_role_str = get_user_role(ctx.author.id)
+                print("got role string:", user_role_str)
+            except Exception as e:
+                print("ERROR in get_user_role:", e)
+                return
             user_role = Role[user_role_str]
+            print("converted to enum:", user_role)
 
             if user_role < minimum_role:
+                print("permission check failed, sending rejection")
                 await ctx.channel.send("Insufficient Permissions")
                 return
-            return await func(ctx,*args,**kwargs)
+            print("permission check passed, calling real function")
+            return await func(ctx, *args, **kwargs)
         return wrapper
     return decorator
  
-                     
-bot = commands.Bot(command_prefix='!', intents=intents)
 
 @bot.event
 async def on_ready():
     print(f"{bot.user.name} is ready!")
+    
 
 
 @bot.event
@@ -85,27 +106,19 @@ async def on_message(message):
 @bot.command()
 @require_role(Role.ADMIN)
 async def trust(ctx):
+    """All mentioned users will become trusted members, and will be able to make requests"""
     for member in ctx.message.mentions:
-        table.put_item(
-            Item={
-                'PK': 'USER#' + str(member.id),
-                'SK': 'PROFILE',
-                'role': 'TRUSTED'
-            }
-        )
+        set_role(member.id,Role.TRUSTED)
+
+    await ctx.channel.send("Mentioned Users are now Trusted")
 
    
 @bot.command()
 @require_role(Role.OWNER)
 async def makeAdmin(ctx):
+    """All mentioned users will become admins, and will be able to appoint trusted users and approve trusted users requests."""
     for member in ctx.message.mentions:
-            table.put_item(
-                Item={
-                    'PK': 'USER#' + str(member.id),
-                    'SK': 'PROFILE',
-                    'role': 'ADMIN'
-                }
-            )
+        set_role(member.id,Role.ADMIN)
 
 
 bot.run(token, log_handler=handler, log_level=logging.DEBUG)
