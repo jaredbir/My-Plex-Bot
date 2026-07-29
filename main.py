@@ -50,7 +50,23 @@ class Role(IntEnum):
 def get_user_role(discord_id):
     response = table.get_item(Key={'PK': 'USER#' + str(discord_id), 'SK': 'PROFILE'})
     return response.get('Item', {}).get('role', 'GUEST')
-                   
+
+
+def require_role(minimum_role):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(ctx, *args, **kwargs):
+            user_role_str = get_user_role(ctx.author.id)
+            user_role = Role[user_role_str]
+
+            if user_role < minimum_role:
+                await ctx.channel.send("Insufficient Permissions")
+                return
+            return await func(ctx,*args,**kwargs)
+        return wrapper
+    return decorator
+ 
+                     
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 @bot.event
@@ -65,15 +81,31 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
+
 @bot.command()
-async def trust(ctx, *, message:str, member:discord.Member):
-    if message.author == ctx.guild.owner and message.mentions:
-        return
-    
+@require_role(Role.ADMIN)
+async def trust(ctx):
+    for member in ctx.message.mentions:
+        table.put_item(
+            Item={
+                'PK': 'USER#' + str(member.id),
+                'SK': 'PROFILE',
+                'role': 'TRUSTED'
+            }
+        )
+
+   
 @bot.command()
-async def makeAdmin(ctx, *, message:str, member:discord.Member):
-    if message.author == ctx.guild.owner and message.mentions:
-        return
+@require_role(Role.OWNER)
+async def makeAdmin(ctx):
+    for member in ctx.message.mentions:
+            table.put_item(
+                Item={
+                    'PK': 'USER#' + str(member.id),
+                    'SK': 'PROFILE',
+                    'role': 'ADMIN'
+                }
+            )
 
 
 bot.run(token, log_handler=handler, log_level=logging.DEBUG)
