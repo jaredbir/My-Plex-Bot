@@ -1,6 +1,6 @@
 import discord
 from discord.ext import commands
-from arrapi import SonarrAPI
+from arrapi import SonarrAPI,RadarrAPI
 import logging
 from dotenv import load_dotenv
 import os
@@ -8,16 +8,31 @@ import boto3
 from enum import IntEnum
 from functools import wraps
 from boto3.dynamodb.conditions import Key
+import re
+import requests
+import asyncio
+import time
+import uuid
+from arrapi.exceptions import NotFound
 
 # --- Configuration & setup ---
 
-# Load environment variables from .env (expects DISCORD_TOKEN)
+# Load environment variables from .env (expects DISCORD_TOKEN, SONARR_TOKEN, and RADARR_TOKEN)
 load_dotenv()
-token = os.getenv('DISCORD_TOKEN')
+Discord_token = os.getenv('DISCORD_TOKEN')
+
+Sonarr_api_key = os.getenv('SONARR_API_KEY')
+Sonarr_url = os.getenv('SONARR_BASE_URL')
+Radarr_api_key = os.getenv('RADARR_API_KEY')
+Radarr_url = os.getenv('RADARR_BASE_URL')
+
 
 # Log bot activity to a file, overwriting on each run
 handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
 
+# Configure Sonarr API
+sonarr = SonarrAPI(Sonarr_url,Sonarr_api_key)
+radarr = RadarrAPI(Radarr_url,Radarr_api_key)
 # Configure intents: need message content to read command args,
 # and members to resolve mentioned users' roles
 intents = discord.Intents.default()
@@ -32,6 +47,25 @@ dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
 table = dynamodb.Table('discord-bot-requests')
 
 
+def get_tvdb_id_from_url(thetvdb_url: str) -> int | None:
+    if 'thetvdb.com' not in thetvdb_url:
+        return None
+
+    response = requests.get(thetvdb_url, timeout=10)
+    response.raise_for_status()
+
+    match = re.search(r'/series/(\d+)/edit', response.text)
+    if match:
+        return int(match.group(1))
+    return None
+
+def get_imdb_id_from_url(imdb_url: str) -> str | None:
+    if 'imdb.com' not in imdb_url:
+        return None
+    match = re.search(r'/title/(tt\d+)', imdb_url)
+    if match:
+        return match.group(1)
+    return None
 # --- Domain model ---
 
 # Role hierarchy, ordered so comparisons like "user_role < minimum_role" work
@@ -140,16 +174,103 @@ async def makeAdmin(ctx):
 
 @bot.command()
 @require_role(Role.TRUSTED)
-async def requestMovie(ctx):
-    # TODO: implement movie request logic (e.g. Radarr lookup + DynamoDB request entry)
-    pass
+async def requestMovie(ctx, imdb_url: str):
+# TODO: implement TV request logic (e.g. SonarrAPI lookup + DynamoDB request entry)
+    imdb_id = await asyncio.to_thread(get_imdb_id_from_url, imdb_url)
+
+    if imdb_id is None:
+        await ctx.channel.send("Could not find a IMDB ID on that page, please confirm that page is valid and try again")
+        return
+
+
+    media_key = {'PK': f'MEDIA#MOVIE#{imdb_id}','SK':'REQUEST'}
+    existing = table.get_item(Key=media_key).get('Item')
+
+    if existing:
+        await ctx.channel.send("That movie has already been requested, please check the requested discord channel.")
+        return
+
+    try:
+        movie = await asyncio.to_thread(radarr.get_movie,imdb_id=imdb_id)
+    except NotFound:
+        await ctx.channel.send("Radarr could not find a show with that IMDB ID.")
+        return
+        # TODO: Have it mention me, or have it bring special attention to me in the requests channel
+    
+    requested_at = int(time.time())
+    request_id = str(uuid.uuid4())
+
+    table.put_item(Item={
+        **media_key,
+        'title': movie.title,
+        'status': 'unfinished',
+        'requestedBy': str(ctx.author.id),
+        'requestedAt': requested_at
+    })
+
+    table.put_item(Item={
+        'PK': f'USER#{ctx.author.id}',
+        'SK': f'REQUEST#{request_id}',
+        'title': movie.title,
+        'imdbID': imdb_id,
+        'type': 'Movie',
+        'status': 'unfinished',
+        'requestedAt': requested_at 
+    })
+
+    await ctx.channel.send(f"{movie.title} has been queued")
+    
 
 
 @bot.command()
 @require_role(Role.TRUSTED)
-async def requestTV(ctx):
+async def requestTV(ctx, thetvdb_url: str):
     # TODO: implement TV request logic (e.g. SonarrAPI lookup + DynamoDB request entry)
-    pass
+    tvdb_id = await asyncio.to_thread(get_tvdb_id_from_url, thetvdb_url)
+
+    if tvdb_id is None:
+        await ctx.channel.send("Could not find a TVDB ID on that page, please confirm that page is valid and try again")
+        return
+
+
+    media_key = {'PK': f'MEDIA#TV#{tvdb_id}','SK':'REQUEST'}
+    existing = table.get_item(Key=media_key).get('Item')
+
+    if existing:
+        await ctx.channel.send("That show has already been requested, please check the requested discord channel.")
+        return
+
+    try:
+        series = await asyncio.to_thread(sonarr.get_series,tvdb_id=tvdb_id)
+    except NotFound:
+        await ctx.channel.send("Sonarr could not find a show with that TVDB ID.")
+        return
+        # TODO: Have it mention me, or have it bring special attention to me in the requests channel
+    
+    requested_at = int(time.time())
+    request_id = str(uuid.uuid4())
+
+    table.put_item(Item={
+        **media_key,
+        'title': series.title,
+        'status': 'unfinished',
+        'requestedBy': str(ctx.author.id),
+        'requestedAt': requested_at
+    })
+
+    table.put_item(Item={
+        'PK': f'USER#{ctx.author.id}',
+        'SK': f'REQUEST#{request_id}',
+        'title': series.title,
+        'tvdbID': tvdb_id,
+        'type': 'TV',
+        'status': 'unfinished',
+        'requestedAt': requested_at 
+    })
+
+    await ctx.channel.send(f"{series.title} has been queued, request id {request_id} ")
+
+    
 
 
 @bot.command()
@@ -170,11 +291,13 @@ async def status(ctx):
 #     }
 # )
 
+# Movie Example
 # table.put_item(
 #     Item={
 #         'PK': 'USER#12345',
 #         'SK': 'REQUEST#abc',
 #         'title': 'test',
+#         'tvdbID': tvdb_id
 #         'status': 'unfinished',
 #         'requestedAt': 1785305756
 #     }
@@ -186,4 +309,4 @@ async def status(ctx):
 
 # --- Entry point ---
 
-bot.run(token, log_handler=handler, log_level=logging.DEBUG)
+bot.run(Discord_token, log_handler=handler, log_level=logging.DEBUG)
