@@ -140,7 +140,47 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
+@bot.event
+async def on_raw_reaction_add(payload):
+    if payload.user_id == bot.user.id:
+        return
 
+    if payload.emoji.name != "✅" and payload.emoji.name != "❌":
+        return
+
+    if Role[get_user_role(payload.user_id)] < Role.ADMIN:
+        return
+
+    message_item = table.get_item(Key={'PK': f'MESSAGE#{payload.message_id}', 'SK': 'REQUEST'}).get('Item')
+
+    if message_item is None:
+        return
+
+    media_item = table.get_item(Key={'PK': message_item['mediaPK'], 'SK': 'REQUEST'}).get('Item')
+
+    if media_item is None or media_item.get('status') != 'unfinished':
+        return
+
+    if payload.emoji.name == "✅":
+        table.update_item(
+            Key={'PK': message_item['mediaPK'], 'SK': 'REQUEST'},
+            UpdateExpression="SET #s = :new_status, approvedBy = :approver",
+            ExpressionAttributeNames={'#s': 'status'},
+            ExpressionAttributeValues={
+                ':new_status': 'approved',
+                ':approver': str(payload.user_id)
+            }
+        )
+    else:
+        table.update_item(
+           Key={'PK': message_item['mediaPK'], 'SK': 'REQUEST'},
+           UpdateExpression="SET #s = :new_status, deniedBy = :denier",
+           ExpressionAttributeNames={'#s': 'status'},
+            ExpressionAttributeValues={
+                ':new_status': 'denied',
+                ':denier': str(payload.user_id)
+            }
+        )
 # --- Role management commands ---
 
 @bot.command()
@@ -175,15 +215,13 @@ async def makeAdmin(ctx):
 @bot.command()
 @require_role(Role.TRUSTED)
 async def requestMovie(ctx, imdb_url: str):
-# TODO: implement TV request logic (e.g. SonarrAPI lookup + DynamoDB request entry)
     imdb_id = await asyncio.to_thread(get_imdb_id_from_url, imdb_url)
 
     if imdb_id is None:
         await ctx.channel.send("Could not find a IMDB ID on that page, please confirm that page is valid and try again")
         return
 
-
-    media_key = {'PK': f'MEDIA#MOVIE#{imdb_id}','SK':'REQUEST'}
+    media_key = {'PK': f'MEDIA#MOVIE#{imdb_id}', 'SK': 'REQUEST'}
     existing = table.get_item(Key=media_key).get('Item')
 
     if existing:
@@ -191,19 +229,32 @@ async def requestMovie(ctx, imdb_url: str):
         return
 
     try:
-        movie = await asyncio.to_thread(radarr.get_movie,imdb_id=imdb_id)
+        movie = await asyncio.to_thread(radarr.get_movie, imdb_id=imdb_id)
     except NotFound:
         await ctx.channel.send("Radarr could not find a show with that IMDB ID.")
         return
-        # TODO: Have it mention me, or have it bring special attention to me in the requests channel
-    
+
     requested_at = int(time.time())
     request_id = str(uuid.uuid4())
+
+    status = "approved" if Role[get_user_role(ctx.author.id)] >= Role.ADMIN else "unfinished"
+
+    if status == "unfinished":
+        sent_message = await ctx.channel.send(f"{movie.title} is pending approval")
+        await sent_message.add_reaction("✅")
+        await sent_message.add_reaction("❌")
+        table.put_item(Item={
+            'PK': f'MESSAGE#{sent_message.id}',
+            'SK': 'REQUEST',
+            'mediaPK': media_key['PK']
+        })
+    else:
+        await ctx.channel.send(f"{movie.title} has been approved and queued")
 
     table.put_item(Item={
         **media_key,
         'title': movie.title,
-        'status': 'unfinished',
+        'status': status,
         'requestedBy': str(ctx.author.id),
         'requestedAt': requested_at
     })
@@ -214,26 +265,21 @@ async def requestMovie(ctx, imdb_url: str):
         'title': movie.title,
         'imdbID': imdb_id,
         'type': 'Movie',
-        'status': 'unfinished',
-        'requestedAt': requested_at 
+        'status': status,
+        'requestedAt': requested_at
     })
-
-    await ctx.channel.send(f"{movie.title} has been queued")
     
-
 
 @bot.command()
 @require_role(Role.TRUSTED)
 async def requestTV(ctx, thetvdb_url: str):
-    # TODO: implement TV request logic (e.g. SonarrAPI lookup + DynamoDB request entry)
     tvdb_id = await asyncio.to_thread(get_tvdb_id_from_url, thetvdb_url)
 
     if tvdb_id is None:
         await ctx.channel.send("Could not find a TVDB ID on that page, please confirm that page is valid and try again")
         return
 
-
-    media_key = {'PK': f'MEDIA#TV#{tvdb_id}','SK':'REQUEST'}
+    media_key = {'PK': f'MEDIA#TV#{tvdb_id}', 'SK': 'REQUEST'}
     existing = table.get_item(Key=media_key).get('Item')
 
     if existing:
@@ -241,19 +287,32 @@ async def requestTV(ctx, thetvdb_url: str):
         return
 
     try:
-        series = await asyncio.to_thread(sonarr.get_series,tvdb_id=tvdb_id)
+        series = await asyncio.to_thread(sonarr.get_series, tvdb_id=tvdb_id)
     except NotFound:
         await ctx.channel.send("Sonarr could not find a show with that TVDB ID.")
         return
-        # TODO: Have it mention me, or have it bring special attention to me in the requests channel
-    
+
     requested_at = int(time.time())
     request_id = str(uuid.uuid4())
+
+    status = "approved" if Role[get_user_role(ctx.author.id)] >= Role.ADMIN else "unfinished"
+
+    if status == "unfinished":
+        sent_message = await ctx.channel.send(f"{series.title} is pending approval")
+        await sent_message.add_reaction("✅")
+        await sent_message.add_reaction("❌")
+        table.put_item(Item={
+            'PK': f'MESSAGE#{sent_message.id}',
+            'SK': 'REQUEST',
+            'mediaPK': media_key['PK']
+        })
+    else:
+        await ctx.channel.send(f"{series.title} has been approved and queued")
 
     table.put_item(Item={
         **media_key,
         'title': series.title,
-        'status': 'unfinished',
+        'status': status,
         'requestedBy': str(ctx.author.id),
         'requestedAt': requested_at
     })
@@ -264,21 +323,14 @@ async def requestTV(ctx, thetvdb_url: str):
         'title': series.title,
         'tvdbID': tvdb_id,
         'type': 'TV',
-        'status': 'unfinished',
-        'requestedAt': requested_at 
+        'status': status,
+        'requestedAt': requested_at
     })
 
-    await ctx.channel.send(f"{series.title} has been queued, request id {request_id} ")
-
-    
-
-
-@bot.command()
-@require_role(Role.TRUSTED)
-async def status(ctx):
-    # TODO: implement status check (e.g. query Status-index GSI for this user's requests)
+@bot.command
+@require_role(Role.ADMIN)
+async def approve(ctx, title:str):
     pass
-
 
 # --- Manual/debug reference snippets (not executed) ---
 
