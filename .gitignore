@@ -225,3 +225,9 @@ venv/
 *-policy.json
 task-definition.json
 .env
+*-policy.json
+task-definition.json
+.env
+*.deb
+a.out
+et
