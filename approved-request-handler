@@ -1,0 +1,77 @@
+import json
+import os
+from boto3.dynamodb.types import TypeDeserializer
+from requests import Session
+from arrapi import SonarrAPI, RadarrAPI
+from arrapi.exceptions import NotFound
+
+Sonarr_api_key = os.getenv('SONARR_API_KEY')
+Sonarr_url = os.getenv('SONARR_BASE_URL')
+Radarr_api_key = os.getenv('RADARR_API_KEY')
+Radarr_url = os.getenv('RADARR_BASE_URL')
+
+cf_client_id = os.getenv('CF_ACCESS_CLIENT_ID')
+cf_client_secret = os.getenv('CF_ACCESS_CLIENT_SECRET')
+
+# Shared session so every arrapi request carries the Cloudflare Access
+# service token headers, letting it through the Access policy
+session = Session()
+session.headers.update({
+    'CF-Access-Client-Id': cf_client_id,
+    'CF-Access-Client-Secret': cf_client_secret
+})
+
+sonarr = SonarrAPI(Sonarr_url, Sonarr_api_key, session=session)
+radarr = RadarrAPI(Radarr_url, Radarr_api_key, session=session)
+
+deserializer = TypeDeserializer()
+
+
+def deserialize(dynamodb_image):
+    return {k: deserializer.deserialize(v) for k, v in dynamodb_image.items()}
+
+
+def lambda_handler(event, context):
+    for record in event['Records']:
+        new_image_raw = record['dynamodb'].get('NewImage')
+        old_image_raw = record['dynamodb'].get('OldImage')
+
+        if new_image_raw is None:
+            continue
+
+        new_image = deserialize(new_image_raw)
+        old_image = deserialize(old_image_raw) if old_image_raw else None
+
+        pk = new_image.get('PK', '')
+
+        if not pk.startswith('MEDIA#'):
+            continue
+
+        if new_image.get('status') != 'approved':
+            continue
+        if old_image is not None and old_image.get('status') == 'approved':
+            continue
+
+        title = new_image.get('title', 'Unknown title')
+
+        if pk.startswith('MEDIA#MOVIE#'):
+            imdb_id = pk.replace('MEDIA#MOVIE#', '')
+            try:
+                movie = radarr.get_movie(imdb_id=imdb_id)
+                movie.add("/data/movies", "Any")
+                print(f"Added movie to Radarr: {title}")
+            except NotFound:
+                print(f"Radarr could not find movie: {title} ({imdb_id})")
+            except Exception as e:
+                print(f"Error adding movie {title}: {e}")
+
+        elif pk.startswith('MEDIA#TV#'):
+            tvdb_id = int(pk.replace('MEDIA#TV#', ''))
+            try:
+                series = sonarr.get_series(tvdb_id=tvdb_id)
+                series.add("/data/tvshows/", "Any")
+                print(f"Added series to Sonarr: {title}")
+            except NotFound:
+                print(f"Sonarr could not find series: {title} ({tvdb_id})")
+            except Exception as e:
+                print(f"Error adding series {title}: {e}")

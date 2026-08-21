@@ -1,0 +1,55 @@
+{
+  "family": "plex-bot-task",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::497206385021:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::497206385021:role/plexBotTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "plex-bot",
+      "image": "497206385021.dkr.ecr.us-east-1.amazonaws.com/plex-bot:latest",
+      "essential": true,
+      "secrets": [
+        {
+          "name": "DISCORD_TOKEN",
+          "valueFrom": "arn:aws:ssm:us-east-1:497206385021:parameter/plex-bot/discord-token"
+        },
+        {
+          "name": "SONARR_API_KEY",
+          "valueFrom": "arn:aws:ssm:us-east-1:497206385021:parameter/plex-bot/sonarr-api-key"
+        },
+        {
+          "name": "SONARR_BASE_URL",
+          "valueFrom": "arn:aws:ssm:us-east-1:497206385021:parameter/plex-bot/sonarr-base-url"
+        },
+        {
+          "name": "RADARR_API_KEY",
+          "valueFrom": "arn:aws:ssm:us-east-1:497206385021:parameter/plex-bot/radarr-api-key"
+        },
+        {
+          "name": "RADARR_BASE_URL",
+          "valueFrom": "arn:aws:ssm:us-east-1:497206385021:parameter/plex-bot/radarr-base-url"
+        },
+        {
+          "name": "CF_ACCESS_CLIENT_ID",
+          "valueFrom": "arn:aws:ssm:us-east-1:497206385021:parameter/plex-bot/cf-access-client-id"
+        },
+        {
+          "name": "CF_ACCESS_CLIENT_SECRET",
+          "valueFrom": "arn:aws:ssm:us-east-1:497206385021:parameter/plex-bot/cf-access-client-secret"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/plex-bot",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "plex-bot",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}
