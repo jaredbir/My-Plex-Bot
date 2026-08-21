@@ -220,4 +220,8 @@ venv
 
 venv/
 .env
-*.log
+*.log*.json
+!package.json
+*-policy.json
+task-definition.json
+.env
