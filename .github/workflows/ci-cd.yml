@@ -71,6 +71,16 @@ jobs:
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$SHORT_SHA" >> "$GITHUB_OUTPUT"
 
+      - name: Fetch current ECS task definition
+        id: current-task-def
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition plex-bot-task \
+            --query taskDefinition > task-definition.json
+          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
+            task-definition.json > task-definition.clean.json
+          mv task-definition.clean.json task-definition.json
+
       - name: Render Amazon ECS task definition
         id: render-task-def
         uses: aws-actions/amazon-ecs-render-task-definition@v1
