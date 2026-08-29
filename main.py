@@ -7,7 +7,7 @@ import os
 import boto3
 from enum import IntEnum
 from functools import wraps
-from boto3.dynamodb.conditions import Key
+from boto3.dynamodb.conditions import Key, Attr
 from requests import Session
 import re
 import requests
@@ -220,15 +220,26 @@ async def trust(ctx):
 @bot.command()
 @require_role(Role.OWNER)
 async def makeAdmin(ctx):
-    """All mentioned users will become admins, and will be able to appoint trusted users and approve trusted users requests."""
+    """All mentioned users will become admins, and will be able to appoint trusted users and approve trusted users requests. Users who are already Admins or Owners are left unchanged."""
     try:
         ctx.message.mentions.remove(ctx.message.author)
     except ValueError:
         pass
-    for member in ctx.message.mentions:
-        set_role(member.id, Role.ADMIN)
 
-    await ctx.channel.send("Mentioned Users are now Admins")
+    newly_promoted = []
+    already_admin = []
+
+    for member in ctx.message.mentions:
+        if Role[get_user_role(member.id)] >= Role.ADMIN:
+            already_admin.append(member.mention)
+        else:
+            set_role(member.id, Role.ADMIN)
+            newly_promoted.append(member.mention)
+
+    if newly_promoted:
+        await ctx.channel.send(f"{', '.join(newly_promoted)} are now Admins")
+    if already_admin:
+        await ctx.channel.send(f"{', '.join(already_admin)} are already an Admin")
 
 
 # --- Media request commands ---
@@ -357,6 +368,93 @@ async def requestTV(ctx, thetvdb_url: str):
         'status': status,
         'requestedAt': requested_at
     })
+
+
+@bot.command()
+@require_role(Role.TRUSTED)
+async def status(ctx):
+    """Shows current download progress for the last 10 requested items."""
+    items = []
+    for status_value in ('unfinished', 'approved', 'denied'):
+        response = table.query(
+            IndexName='Status-index',
+            KeyConditionExpression=Key('status').eq(status_value),
+            FilterExpression=Attr('PK').begins_with('USER#'),
+            ScanIndexForward=False
+        )
+        items.extend(response.get('Items', []))
+
+    if not items:
+        await ctx.channel.send("No requests yet.")
+        return
+
+    items.sort(key=lambda item: item['requestedAt'], reverse=True)
+    items = items[:10]
+
+    needs_radarr_queue = any(item.get('status') == 'approved' and item.get('type') == 'Movie' for item in items)
+    needs_sonarr_queue = any(item.get('status') == 'approved' and item.get('type') == 'TV' for item in items)
+
+    radarr_queue_records = []
+    sonarr_queue_records = []
+
+    if needs_radarr_queue:
+        radarr_queue = await asyncio.to_thread(radarr._raw._get, "queue", pageSize=250)
+        radarr_queue_records = radarr_queue.get('records', [])
+
+    if needs_sonarr_queue:
+        sonarr_queue = await asyncio.to_thread(sonarr._raw._get, "queue", pageSize=250)
+        sonarr_queue_records = sonarr_queue.get('records', [])
+
+    def format_progress(size, sizeleft):
+        percent = round((1 - sizeleft / size) * 100) if size > 0 else 0
+        size_gb = size / (1024 ** 3)
+        left_gb = sizeleft / (1024 ** 3)
+        downloaded_gb = size_gb - left_gb
+        return f"⬇️ {percent}% ({downloaded_gb:.1f}GB / {size_gb:.1f}GB)"
+
+    lines = ["**Recent Requests**"]
+
+    for i, item in enumerate(items, start=1):
+        title = item.get('title', 'Unknown')
+        media_type = item.get('type', 'Unknown')
+
+        if item.get('status') == 'unfinished':
+            progress = "⏳ Pending approval"
+        elif item.get('status') == 'denied':
+            progress = "❌ Denied"
+        elif media_type == 'Movie':
+            try:
+                movie = await asyncio.to_thread(radarr.get_movie, imdb_id=item.get('imdbID'))
+            except NotFound:
+                progress = "⚠️ Not found in Radarr"
+            else:
+                if movie.hasFile:
+                    progress = "✅ Downloaded"
+                else:
+                    record = next((r for r in radarr_queue_records if r.get('movieId') == movie.id), None)
+                    if record:
+                        progress = format_progress(record.get('size', 0), record.get('sizeleft', 0))
+                    else:
+                        progress = "🔍 Searching / not yet downloading"
+        elif media_type == 'TV':
+            try:
+                series = await asyncio.to_thread(sonarr.get_series, tvdb_id=item.get('tvdbID'))
+            except NotFound:
+                progress = "⚠️ Not found in Sonarr"
+            else:
+                record = next((r for r in sonarr_queue_records if r.get('seriesId') == series.id), None)
+                if record:
+                    progress = format_progress(record.get('size', 0), record.get('sizeleft', 0))
+                elif series.episodeFileCount:
+                    progress = "✅ Downloaded"
+                else:
+                    progress = "🔍 Searching / not yet downloading"
+        else:
+            progress = "⚠️ Unknown request type"
+
+        lines.append(f"{i}. {title} ({media_type}) — {progress}")
+
+    await ctx.channel.send("\n".join(lines))
 
 
 # --- Entry point ---
