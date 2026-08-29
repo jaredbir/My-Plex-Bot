@@ -1,0 +1,46 @@
+# Version control / CI
+.git
+.gitignore
+.github/
+
+# Python build/runtime cruft
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Tests (not needed at runtime)
+tests/
+
+# Env / secrets
+.env
+
+# Logs
+discord.log
+*.log
+
+# Misc local artifacts
+*.deb
+a.out
+et
+test script
+
+# Docs
+README.md
+
+# AWS / IAM policy and infra files (not needed inside the container)
+*-policy.json
+ecs-exec-policy.json
+ecs-trust-policy.json
+ssm-access-policy.json
+task-definition.json
+approved-request-handler
+
+# Docker itself
+Dockerfile
+.dockerignore

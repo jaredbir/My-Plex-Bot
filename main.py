@@ -228,6 +228,8 @@ async def makeAdmin(ctx):
     for member in ctx.message.mentions:
         set_role(member.id, Role.ADMIN)
 
+    await ctx.channel.send("Mentioned Users are now Admins")
+
 
 # --- Media request commands ---
 
@@ -251,6 +253,10 @@ async def requestMovie(ctx, imdb_url: str):
         movie = await asyncio.to_thread(radarr.get_movie, imdb_id=imdb_id)
     except NotFound:
         await ctx.channel.send("Radarr could not find a show with that IMDB ID.")
+        return
+
+    if movie.hasFile:
+        await ctx.channel.send(f"{movie.title} is already in the library.")
         return
 
     requested_at = int(time.time())
@@ -312,6 +318,10 @@ async def requestTV(ctx, thetvdb_url: str):
         await ctx.channel.send("Sonarr could not find a show with that TVDB ID.")
         return
 
+    if series.episodeFileCount:
+        await ctx.channel.send(f"{series.title} is already in the library.")
+        return
+
     requested_at = int(time.time())
     request_id = str(uuid.uuid4())
 
@@ -351,4 +361,5 @@ async def requestTV(ctx, thetvdb_url: str):
 
 # --- Entry point ---
 
-bot.run(Discord_token, log_handler=handler, log_level=logging.DEBUG)
+if __name__ == "__main__":
+    bot.run(Discord_token, log_handler=handler, log_level=logging.DEBUG)
