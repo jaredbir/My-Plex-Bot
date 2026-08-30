@@ -14,6 +14,7 @@ import requests
 import asyncio
 import time
 import uuid
+from collections import Counter
 from arrapi.exceptions import NotFound
 
 # --- Configuration & setup ---
@@ -361,6 +362,11 @@ COMMAND_DOCS = [
         "min_role": Role.ADMIN,
         "description": "Creates (or refreshes) the #help channel with this command reference.",
     },
+    {
+        "usage": "!setupStats",
+        "min_role": Role.ADMIN,
+        "description": "Creates (or refreshes) the #stats channel with the request leaderboard. Once created, it's kept current automatically.",
+    },
 ]
 
 
@@ -408,6 +414,118 @@ async def setup_help(ctx):
     await help_channel.send(embed=build_help_embed())
 
     await ctx.channel.send(f"Done — check {help_channel.mention}")
+
+
+# --- Stats ---
+
+def compute_request_stats():
+    items = []
+    for status_value in ('unfinished', 'approved', 'denied'):
+        response = table.query(
+            IndexName='Status-index',
+            KeyConditionExpression=Key('status').eq(status_value),
+            FilterExpression=Attr('PK').begins_with('USER#')
+        )
+        items.extend(response.get('Items', []))
+
+    by_status = Counter(item.get('status', 'unknown') for item in items)
+    by_type = Counter(item.get('type', 'Unknown') for item in items)
+    by_requester = Counter(item['PK'].split('#', 1)[1] for item in items)
+
+    approved = by_status.get('approved', 0)
+    denied = by_status.get('denied', 0)
+    decided = approved + denied
+    approval_rate = round((approved / decided) * 100) if decided else None
+
+    return {
+        'total': len(items),
+        'by_status': by_status,
+        'by_type': by_type,
+        'top_requesters': by_requester.most_common(5),
+        'approval_rate': approval_rate,
+    }
+
+
+def build_stats_embed():
+    stats = compute_request_stats()
+
+    embed = discord.Embed(
+        title="📊 Plex Bot Stats",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="Total Requests", value=str(stats['total']), inline=True)
+    embed.add_field(
+        name="Movies / TV",
+        value=f"{stats['by_type'].get('Movie', 0)} / {stats['by_type'].get('TV', 0)}",
+        inline=True,
+    )
+    embed.add_field(
+        name="Approval Rate",
+        value=f"{stats['approval_rate']}%" if stats['approval_rate'] is not None else "No decisions yet",
+        inline=True,
+    )
+    embed.add_field(
+        name="Status Breakdown",
+        value=(
+            f"✅ Approved: {stats['by_status'].get('approved', 0)}\n"
+            f"❌ Denied: {stats['by_status'].get('denied', 0)}\n"
+            f"⏳ Pending: {stats['by_status'].get('unfinished', 0)}"
+        ),
+        inline=False,
+    )
+
+    if stats['top_requesters']:
+        leaderboard = "\n".join(
+            f"{i}. <@{user_id}> — {count}"
+            for i, (user_id, count) in enumerate(stats['top_requesters'], start=1)
+        )
+    else:
+        leaderboard = "No requests yet."
+    embed.add_field(name="Top Requesters", value=leaderboard, inline=False)
+
+    return embed
+
+
+@bot.command(name='setupStats')
+@require_role(Role.ADMIN)
+async def setup_stats(ctx):
+    """Creates (or refreshes) a #stats channel with the request leaderboard."""
+    guild = ctx.guild
+    if guild is None:
+        await ctx.channel.send("This command only works in a server.")
+        return
+
+    stats_channel = discord.utils.get(guild.text_channels, name='stats')
+
+    if stats_channel is None:
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(send_messages=False, view_channel=True),
+            guild.me: discord.PermissionOverwrite(send_messages=True, view_channel=True),
+        }
+        try:
+            stats_channel = await guild.create_text_channel(
+                'stats', overwrites=overwrites, reason="Bot request stats"
+            )
+        except discord.Forbidden:
+            await ctx.channel.send("I don't have permission to create channels in this server.")
+            return
+    else:
+        await stats_channel.purge(limit=50, check=lambda m: m.author == bot.user)
+
+    await stats_channel.send(embed=build_stats_embed())
+
+    await ctx.channel.send(f"Done — check {stats_channel.mention}")
+
+
+async def refresh_stats_channels():
+    """Keeps any already-set-up #stats channel current. Does not create one --
+    that's !setupStats's job -- only refreshes channels admins opted into."""
+    for guild in bot.guilds:
+        stats_channel = discord.utils.get(guild.text_channels, name='stats')
+        if stats_channel is None:
+            continue
+        await stats_channel.purge(limit=50, check=lambda m: m.author == bot.user)
+        await stats_channel.send(embed=build_stats_embed())
 
 
 # --- Media request commands ---
@@ -745,6 +863,11 @@ async def periodic_maintenance():
         await sweep_stale_requests()
     except Exception as e:
         print("ERROR in sweep_stale_requests:", e)
+
+    try:
+        await refresh_stats_channels()
+    except Exception as e:
+        print("ERROR in refresh_stats_channels:", e)
 
 
 # --- Entry point ---

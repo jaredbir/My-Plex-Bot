@@ -16,6 +16,7 @@ So I built my own version: a Discord bot, hosted entirely on AWS, that talks dir
 - Admins and I skip the approval step entirely — our requests go straight through.
 - Once something's approved, a Lambda function picks it up automatically and adds it to Sonarr/Radarr — no manual step on my end at all.
 - Admins can run `!setupHelp` to set up a read-only `#help` channel that documents every command for everyone in the server, so people don't have to ask what they can do.
+- Admins can run `!setupStats` to set up a read-only `#stats` channel showing request totals, approval rate, and a top-requesters leaderboard, which the bot then keeps refreshed automatically every 10 minutes.
 - Every request's lifecycle — requested, approved, denied, now available — gets posted to a read-only `#request-log` channel that the bot creates on its own the first time it's needed, so the server has a running audit trail without me digging through old messages.
 - A background task checks approved requests against Sonarr/Radarr every 10 minutes, and once a title's actually finished downloading, the bot announces it in `#request-log` with who requested it, then marks it announced so it's never posted twice.
 - Admins can run `!untrust @user` to walk a trusted role back to guest, and `!pending` to see everything still awaiting approval without scrolling back through old reaction messages.
