@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from arrapi import SonarrAPI, RadarrAPI
 import logging
 from dotenv import load_dotenv
@@ -84,6 +84,15 @@ class Role(IntEnum):
     OWNER = 3
 
 
+# --- Cleanup / notification tuning ---
+
+SECONDS_PER_DAY = 86400
+DENIED_ITEM_TTL_DAYS = 30          # how long a denied request stays in the table before DynamoDB TTL deletes it
+STALE_REQUEST_THRESHOLD_DAYS = 14  # how long a request can sit unapproved before it's considered stale
+STALE_ITEM_TTL_DAYS = 7            # grace period after an item is flagged stale before it's deleted
+MAINTENANCE_INTERVAL_MINUTES = 10  # how often the availability/staleness sweep runs
+
+
 # --- Data access helpers ---
 
 def set_role(discord_id, role):
@@ -99,6 +108,16 @@ def set_role(discord_id, role):
 def get_user_role(discord_id):
     response = table.get_item(Key={'PK': 'USER#' + str(discord_id), 'SK': 'PROFILE'})
     return response.get('Item', {}).get('role', 'GUEST')
+
+
+def media_pk_for_request(item):
+    """Reconstructs a MEDIA# item's PK from a USER# request record, so the
+    two copies of a request can be updated together."""
+    if item.get('type') == 'Movie' and item.get('imdbID'):
+        return f'MEDIA#MOVIE#{item["imdbID"]}'
+    if item.get('type') == 'TV' and item.get('tvdbID'):
+        return f'MEDIA#TV#{item["tvdbID"]}'
+    return None
 
 
 # --- Permission decorator ---
@@ -123,11 +142,39 @@ def require_role(minimum_role):
     return decorator
 
 
+# --- Request log channel ---
+
+async def log_request_event(guild, message: str):
+    """Best-effort post to the #request-log channel (creating it if needed).
+    Logging is auxiliary -- any failure here must never break the request/
+    approval flow that called it, so all errors are swallowed."""
+    if guild is None:
+        return
+
+    try:
+        log_channel = discord.utils.get(guild.text_channels, name='request-log')
+
+        if log_channel is None:
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(send_messages=False, view_channel=True),
+                guild.me: discord.PermissionOverwrite(send_messages=True, view_channel=True),
+            }
+            log_channel = await guild.create_text_channel(
+                'request-log', overwrites=overwrites, reason="Request activity log"
+            )
+
+        await log_channel.send(message)
+    except Exception as e:
+        print("ERROR in log_request_event:", e)
+
+
 # --- Bot events ---
 
 @bot.event
 async def on_ready():
     print(f"{bot.user.name} is ready!")
+    if not periodic_maintenance.is_running():
+        periodic_maintenance.start()
 
 
 @bot.event
@@ -164,6 +211,9 @@ async def on_raw_reaction_add(payload):
         'SK': f"REQUEST#{media_item['requestId']}"
     }
 
+    guild = bot.get_guild(payload.guild_id)
+    title = media_item.get('title', 'Unknown')
+
     if payload.emoji.name == "✅":
         table.update_item(
             Key={'PK': message_item['mediaPK'], 'SK': 'REQUEST'},
@@ -183,25 +233,30 @@ async def on_raw_reaction_add(payload):
                 ':approver': str(payload.user_id)
             }
         )
+        await log_request_event(guild, f"✅ **{title}** approved by <@{payload.user_id}>")
     else:
+        expires_at = int(time.time()) + DENIED_ITEM_TTL_DAYS * SECONDS_PER_DAY
         table.update_item(
             Key={'PK': message_item['mediaPK'], 'SK': 'REQUEST'},
-            UpdateExpression="SET #s = :new_status, deniedBy = :denier",
+            UpdateExpression="SET #s = :new_status, deniedBy = :denier, expiresAt = :expires_at",
             ExpressionAttributeNames={'#s': 'status'},
             ExpressionAttributeValues={
                 ':new_status': 'denied',
-                ':denier': str(payload.user_id)
+                ':denier': str(payload.user_id),
+                ':expires_at': expires_at
             }
         )
         table.update_item(
             Key=user_request_key,
-            UpdateExpression="SET #s = :new_status, deniedBy = :denier",
+            UpdateExpression="SET #s = :new_status, deniedBy = :denier, expiresAt = :expires_at",
             ExpressionAttributeNames={'#s': 'status'},
             ExpressionAttributeValues={
                 ':new_status': 'denied',
-                ':denier': str(payload.user_id)
+                ':denier': str(payload.user_id),
+                ':expires_at': expires_at
             }
         )
+        await log_request_event(guild, f"❌ **{title}** denied by <@{payload.user_id}>")
 
 
 # --- Role management commands ---
@@ -215,6 +270,22 @@ async def trust(ctx):
             set_role(member.id, Role.TRUSTED)
 
     await ctx.channel.send("Mentioned Users are now Trusted")
+
+
+@bot.command()
+@require_role(Role.ADMIN)
+async def untrust(ctx):
+    """All mentioned users who are currently Trusted are reverted to Guest. Admins/Owners are left unchanged."""
+    demoted = []
+    for member in ctx.message.mentions:
+        if Role[get_user_role(member.id)] == Role.TRUSTED:
+            set_role(member.id, Role.GUEST)
+            demoted.append(member.mention)
+
+    if demoted:
+        await ctx.channel.send(f"{', '.join(demoted)} are no longer Trusted")
+    else:
+        await ctx.channel.send("None of the mentioned users were Trusted")
 
 
 @bot.command()
@@ -240,6 +311,103 @@ async def makeAdmin(ctx):
         await ctx.channel.send(f"{', '.join(newly_promoted)} are now Admins")
     if already_admin:
         await ctx.channel.send(f"{', '.join(already_admin)} are already an Admin")
+
+
+# --- Help / documentation ---
+
+COMMAND_DOCS = [
+    {
+        "usage": "!requestMovie <imdb_url>",
+        "min_role": Role.TRUSTED,
+        "description": "Request a movie by pasting its IMDb page link. The bot looks it up in Radarr; if it's not already in the library or already requested, it's posted for approval (or added immediately if you're an Admin/Owner).",
+    },
+    {
+        "usage": "!requestTV <thetvdb_url>",
+        "min_role": Role.TRUSTED,
+        "description": "Request a TV show by pasting its TheTVDB page link. Same flow as !requestMovie, but through Sonarr.",
+    },
+    {
+        "usage": "!status",
+        "min_role": Role.TRUSTED,
+        "description": "Shows your last 10 requests and their current download progress.",
+    },
+    {
+        "usage": "✅ / ❌ react on a pending request",
+        "min_role": Role.ADMIN,
+        "description": "Approve or deny a request that's waiting on approval by reacting on its message.",
+    },
+    {
+        "usage": "!trust @user [@user2 ...]",
+        "min_role": Role.ADMIN,
+        "description": "Marks the mentioned users as Trusted, letting them use !requestMovie, !requestTV, and !status.",
+    },
+    {
+        "usage": "!untrust @user [@user2 ...]",
+        "min_role": Role.ADMIN,
+        "description": "Reverts the mentioned users from Trusted back to Guest. Admins/Owners are left unchanged.",
+    },
+    {
+        "usage": "!pending",
+        "min_role": Role.ADMIN,
+        "description": "Lists every request that's currently awaiting approval.",
+    },
+    {
+        "usage": "!makeAdmin @user [@user2 ...]",
+        "min_role": Role.OWNER,
+        "description": "Promotes the mentioned users to Admin, letting them approve/deny requests and trust new users. Requests from Admins and the Owner skip approval entirely.",
+    },
+    {
+        "usage": "!setupHelp",
+        "min_role": Role.ADMIN,
+        "description": "Creates (or refreshes) the #help channel with this command reference.",
+    },
+]
+
+
+def build_help_embed():
+    embed = discord.Embed(
+        title="📖 Plex Bot Commands",
+        description="Here's everything the bot can do. Anything above your role will just reply \"Insufficient Permissions.\"",
+        color=discord.Color.blurple(),
+    )
+    for doc in COMMAND_DOCS:
+        embed.add_field(
+            name=doc["usage"],
+            value=f"{doc['description']}\n*Requires: {doc['min_role'].name}+*",
+            inline=False,
+        )
+    return embed
+
+
+@bot.command(name='setupHelp')
+@require_role(Role.ADMIN)
+async def setup_help(ctx):
+    """Creates (or refreshes) a #help channel documenting every command."""
+    guild = ctx.guild
+    if guild is None:
+        await ctx.channel.send("This command only works in a server.")
+        return
+
+    help_channel = discord.utils.get(guild.text_channels, name='help')
+
+    if help_channel is None:
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(send_messages=False, view_channel=True),
+            guild.me: discord.PermissionOverwrite(send_messages=True, view_channel=True),
+        }
+        try:
+            help_channel = await guild.create_text_channel(
+                'help', overwrites=overwrites, reason="Bot command documentation"
+            )
+        except discord.Forbidden:
+            await ctx.channel.send("I don't have permission to create channels in this server.")
+            return
+    else:
+        await help_channel.purge(limit=50, check=lambda m: m.author == bot.user)
+
+    await help_channel.send(embed=build_help_embed())
+
+    await ctx.channel.send(f"Done — check {help_channel.mention}")
 
 
 # --- Media request commands ---
@@ -284,8 +452,10 @@ async def requestMovie(ctx, imdb_url: str):
             'SK': 'REQUEST',
             'mediaPK': media_key['PK']
         })
+        await log_request_event(ctx.guild, f"📥 **{movie.title}** (Movie) requested by <@{ctx.author.id}> — pending approval")
     else:
         await ctx.channel.send(f"{movie.title} has been approved and queued")
+        await log_request_event(ctx.guild, f"✅ **{movie.title}** (Movie) requested by <@{ctx.author.id}> — auto-approved")
 
     table.put_item(Item={
         **media_key,
@@ -347,8 +517,10 @@ async def requestTV(ctx, thetvdb_url: str):
             'SK': 'REQUEST',
             'mediaPK': media_key['PK']
         })
+        await log_request_event(ctx.guild, f"📥 **{series.title}** (TV) requested by <@{ctx.author.id}> — pending approval")
     else:
         await ctx.channel.send(f"{series.title} has been approved and queued")
+        await log_request_event(ctx.guild, f"✅ **{series.title}** (TV) requested by <@{ctx.author.id}> — auto-approved")
 
     table.put_item(Item={
         **media_key,
@@ -455,6 +627,124 @@ async def status(ctx):
         lines.append(f"{i}. {title} ({media_type}) — {progress}")
 
     await ctx.channel.send("\n".join(lines))
+
+
+@bot.command(name='pending')
+@require_role(Role.ADMIN)
+async def pending(ctx):
+    """Lists every request currently awaiting approval."""
+    response = table.query(
+        IndexName='Status-index',
+        KeyConditionExpression=Key('status').eq('unfinished'),
+        FilterExpression=Attr('PK').begins_with('USER#'),
+        ScanIndexForward=False
+    )
+    items = response.get('Items', [])
+
+    if not items:
+        await ctx.channel.send("No requests are pending approval.")
+        return
+
+    items.sort(key=lambda item: item['requestedAt'], reverse=True)
+
+    lines = ["**Pending Approval**"]
+    for i, item in enumerate(items, start=1):
+        requester_id = item['PK'].split('#', 1)[1]
+        title = item.get('title', 'Unknown')
+        media_type = item.get('type', 'Unknown')
+        lines.append(f"{i}. {title} ({media_type}) — requested by <@{requester_id}>")
+
+    await ctx.channel.send("\n".join(lines))
+
+
+# --- Availability notifications & stale-request cleanup ---
+
+async def check_available_requests():
+    """Finds approved requests that have finished downloading and haven't
+    been announced yet, posts to #request-log, and marks them notified."""
+    response = table.query(
+        IndexName='Status-index',
+        KeyConditionExpression=Key('status').eq('approved'),
+        FilterExpression=Attr('PK').begins_with('USER#') & Attr('notifiedAvailable').not_exists()
+    )
+
+    for item in response.get('Items', []):
+        media_type = item.get('type')
+
+        if media_type == 'Movie':
+            try:
+                movie = await asyncio.to_thread(radarr.get_movie, imdb_id=item.get('imdbID'))
+            except NotFound:
+                continue
+            available = movie.hasFile
+        elif media_type == 'TV':
+            try:
+                series = await asyncio.to_thread(sonarr.get_series, tvdb_id=item.get('tvdbID'))
+            except NotFound:
+                continue
+            available = bool(series.episodeFileCount)
+        else:
+            continue
+
+        if not available:
+            continue
+
+        requester_id = item['PK'].split('#', 1)[1]
+        title = item.get('title', 'Unknown')
+
+        for guild in bot.guilds:
+            await log_request_event(guild, f"🎬 **{title}** is now available on Plex! (requested by <@{requester_id}>)")
+
+        table.update_item(
+            Key={'PK': item['PK'], 'SK': item['SK']},
+            UpdateExpression="SET notifiedAvailable = :true_val",
+            ExpressionAttributeValues={':true_val': True}
+        )
+
+
+async def sweep_stale_requests():
+    """Flags requests that have sat unapproved past the staleness threshold
+    with a near-term DynamoDB TTL, so they eventually clean themselves up."""
+    cutoff = int(time.time()) - STALE_REQUEST_THRESHOLD_DAYS * SECONDS_PER_DAY
+
+    response = table.query(
+        IndexName='Status-index',
+        KeyConditionExpression=Key('status').eq('unfinished'),
+        FilterExpression=Attr('PK').begins_with('USER#') & Attr('expiresAt').not_exists()
+    )
+
+    for item in response.get('Items', []):
+        if item.get('requestedAt', 0) >= cutoff:
+            continue
+
+        expires_at = int(time.time()) + STALE_ITEM_TTL_DAYS * SECONDS_PER_DAY
+
+        table.update_item(
+            Key={'PK': item['PK'], 'SK': item['SK']},
+            UpdateExpression="SET expiresAt = :expires_at",
+            ExpressionAttributeValues={':expires_at': expires_at}
+        )
+
+        media_pk = media_pk_for_request(item)
+        if media_pk:
+            table.update_item(
+                Key={'PK': media_pk, 'SK': 'REQUEST'},
+                UpdateExpression="SET expiresAt = :expires_at",
+                ExpressionAttributeValues={':expires_at': expires_at}
+            )
+
+
+@tasks.loop(minutes=MAINTENANCE_INTERVAL_MINUTES)
+async def periodic_maintenance():
+    try:
+        await check_available_requests()
+    except Exception as e:
+        print("ERROR in check_available_requests:", e)
+
+    try:
+        await sweep_stale_requests()
+    except Exception as e:
+        print("ERROR in sweep_stale_requests:", e)
 
 
 # --- Entry point ---
